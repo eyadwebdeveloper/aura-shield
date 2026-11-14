@@ -14,18 +14,28 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "CORPUS — Interactive 3D Human Anatomy",
+  title: "AURA — Astro-Shield Crew Challenge & CORPUS 3D Anatomy",
   description:
-    "Explore three open anatomical reference bodies — male, female, and donor lower-limb muscles — as 3,454 individually selectable structures in the browser. CC BY 4.0 data from BodyParts3D, the Human Reference Atlas, and Andreassen et al. 2023.",
-  keywords: ["anatomy", "3D", "interactive", "human body", "BodyParts3D", "Human Reference Atlas", "three.js"],
+    "Two 3D applications in one cockpit: ASTRO-SHIELD, a playable 2-minute rover run that doubles as a stealth cognitive & behavioral assessment (PVT and POMS constructs), and CORPUS, an interactive 3D human anatomy explorer built on open CC BY reference bodies.",
+  keywords: [
+    "3D game",
+    "stealth assessment",
+    "PVT",
+    "POMS",
+    "aerospace medicine",
+    "anatomy",
+    "3D",
+    "interactive",
+    "three.js",
+  ],
   icons: {
     icon: "https://z-cdn.chatglm.cn/z-ai/static/logo.svg",
   },
   openGraph: {
-    title: "CORPUS — Interactive 3D Human Anatomy",
+    title: "AURA — Astro-Shield Crew Challenge & CORPUS 3D Anatomy",
     description:
-      "Three open reference bodies, 3,454 selectable structures, one browser. Built on CC BY anatomy data.",
-    siteName: "CORPUS",
+      "Pilot the rover, power the habitat shield — and explore a 3D human atlas. Two Three.js applications in the browser.",
+    siteName: "AURA",
     type: "website",
   },
 };

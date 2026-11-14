@@ -1,14 +1,14 @@
 'use client';
 
 /** Top bar (brand, model switcher, stats, search) and bottom control dock. */
-import { Activity, Info, Layers3, Pause, RotateCcw, RotateCw, Search } from 'lucide-react';
+import { Activity, Gamepad2, Info, Layers3, Pause, RotateCcw, RotateCw, Search } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Slider } from '@/components/ui/slider';
 import { MODELS } from '@/lib/anatomy/types';
 import { useAtlas } from '@/store/atlas';
 import type { ViewId } from './engine';
 
-export function Header() {
+export function Header({ onLaunchGame }: { onLaunchGame?: () => void }) {
   const model = useAtlas((s) => s.model);
   const setModel = useAtlas((s) => s.setModel);
   const atlas = useAtlas((s) => s.atlas);
@@ -65,6 +65,18 @@ export function Header() {
 
       {/* Actions */}
       <div className="flex shrink-0 items-center gap-1.5">
+        {onLaunchGame && (
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={onLaunchGame}
+            className="h-9 gap-2 rounded-lg border-amber-400/25 bg-amber-400/[0.08] pl-2.5 pr-2.5 text-[12.5px] text-amber-200/90 transition-colors hover:bg-amber-400/[0.16] hover:text-amber-100"
+            aria-label="Open the Astro-Shield crew challenge game"
+          >
+            <Gamepad2 size={14} />
+            <span className="hidden sm:inline">Astro-Shield</span>
+          </Button>
+        )}
         <Button
           variant="outline"
           size="sm"
