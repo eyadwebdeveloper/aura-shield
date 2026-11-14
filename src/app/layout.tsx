@@ -28,9 +28,6 @@ export const metadata: Metadata = {
     "interactive",
     "three.js",
   ],
-  icons: {
-    icon: "https://z-cdn.chatglm.cn/z-ai/static/logo.svg",
-  },
   openGraph: {
     title: "AURA — Astro-Shield Crew Challenge & CORPUS 3D Anatomy",
     description:
@@ -49,6 +46,7 @@ export default function RootLayout({
     <html lang="en" className="dark" suppressHydrationWarning>
       <body
         className={`${geistSans.variable} ${geistMono.variable} antialiased bg-[#070a0e] text-zinc-100`}
+        suppressHydrationWarning
       >
         {children}
         <Toaster />
