@@ -1,0 +1,890 @@
+     1→     1→/** AnatomyScene — the 3D engine behind the viewer.
+     2→     2→ *
+     3→     3→ * One instance owns the renderer, camera, lights, and the currently mounted
+     4→     4→ * atlas. Structures are mounted per chunk as zero-copy typed-array views into
+     5→     5→ * the decompressed chunk ArrayBuffer:
+     6→     6→ *
+     7→     7→ *   positions: Float32Array(buffer, part.positions, part.vertexCount * 3)
+     8→     8→ *   normals:   Int16Array (buffer, part.normals,   part.vertexCount * 3)  // unit*32767
+     9→     9→ *   indices:   Uint32Array(buffer, part.indices,   part.indexCount)
+    10→    10→ *
+    11→    11→ * For rendering, structures of the same (system, chunk) are merged into one
+    12→    12→ * geometry. Every vertex carries a `partIndex` attribute that indexes into a
+    13→    13→ * small RGBA-float texture holding that structure's runtime state: xyz = explode
+    14→    14→ * offset, w = visibility. A second byte texture drives hover/selection tint.
+    15→    15→ * This keeps the whole atlas at a handful of draw calls while every one of the
+    16→    16→ * thousands of structures stays individually addressable.
+    17→    17→ *
+    18→    18→ * Picking uses detached per-structure meshes (cheap bounding-box pre-test,
+    19→    19→ * then exact ray/geometry intersection), moved in step with the explode offsets.
+    20→    20→ */
+    21→    21→import * as THREE from 'three';
+    22→    22→import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
+    23→    23→import { mergeGeometries } from "three/examples/jsm/utils/BufferGeometryUtils.js";
+    24→    24→import { AtlasLibrary } from "../../lib/anatomy/loader";
+    25→    25→import { packInventory } from "../../lib/anatomy/layout";
+    26→    26→import {
+    27→    27→  SYSTEM_META,
+    28→    28→  SYSTEM_MAP,
+    29→    29→  type AtlasManifest,
+    30→    30→  type Part,
+    31→    31→  type SystemId,
+    32→    32→} from "../../lib/anatomy/types";
+    33→    33→
+    34→    34→export type ViewId = 'three-quarter' | 'front' | 'back' | 'side';
+    35→    35→
+    36→    36→export interface EngineState {
+    37→    37→  visible: SystemId[];
+    38→    38→  selected: string[];
+    39→    39→  /** Body systems drawn in full color. Everything else fades back. */
+    40→    40→  emphasis: SystemId[];
+    41→    41→  isolate: boolean;
+    42→    42→  explode: number;
+    43→    43→  view: ViewId;
+    44→    44→  autoRotate: boolean;
+    45→    45→  reset: number;
+    46→    46→  focus: number;
+    47→    47→}
+    48→    48→
+    49→    49→export interface HoverInfo {
+    50→    50→  id: string;
+    51→    51→  name: string;
+    52→    52→  system: SystemId;
+    53→    53→  x: number;
+    54→    54→  y: number;
+    55→    55→}
+    56→    56→
+    57→    57→export interface EngineCallbacks {
+    58→    58→  onHover: (info: HoverInfo | null) => void;
+    59→    59→  onPick: (partId: string | null, system?: SystemId) => void;
+    60→    60→  onActivate: (partId: string) => void;
+    61→    61→  onProgress: (p: { loaded: number; total: number } | null) => void;
+    62→    62→  onError: (message: string) => void;
+    63→    63→}
+    64→    64→
+    65→    65→const ACCENT = new THREE.Color("#24554b");
+    66→    66→const FAN_RADIUS = 0.52;
+    67→    67→const STAGE_Y = 0.85;
+    68→    68→
+    69→    69→interface Tap {
+    70→    70→  x: number;
+    71→    71→  y: number;
+    72→    72→  pointerId: number;
+    73→    73→  drag: boolean;
+    74→    74→  threshold: number;
+    75→    75→}
+    76→    76→
+    77→    77→interface Tween {
+    78→    78→  fromPos: THREE.Vector3;
+    79→    79→  toPos: THREE.Vector3;
+    80→    80→  fromTarget: THREE.Vector3;
+    81→    81→  toTarget: THREE.Vector3;
+    82→    82→  t: number;
+    83→    83→  dur: number;
+    84→    84→}
+    85→    85→
+    86→    86→export class AnatomyEngine {
+    87→    87→  private renderer: THREE.WebGLRenderer;
+    88→    88→  private scene = new THREE.Scene();
+    89→    89→  private camera: THREE.PerspectiveCamera;
+    90→    90→  private controls: OrbitControls;
+    91→    91→  private library = new AtlasLibrary();
+    92→    92→  private cb: EngineCallbacks;
+    93→    93→  private host: HTMLElement;
+    94→    94→
+    95→    95→  // Atlas currently mounted
+    96→    96→  private atlas: AtlasManifest | null = null;
+    97→    97→  private manifestUrl = '';
+    98→    98→  private partsByChunk = new Map<number, Part[]>();
+    99→    99→  private partIndex = new Map<string, number>();
+   100→   100→  private stateWidth = 1;
+   101→   101→  private stateData!: Float32Array;
+   102→   102→  private selData!: Uint8Array;
+   103→   103→  private stateTexture!: THREE.DataTexture;
+   104→   104→  private selTexture!: THREE.DataTexture;
+   105→   105→  private materials = new Map<string, THREE.MeshStandardMaterial>();
+   106→   106→  private batchMeshes: THREE.Mesh[] = [];
+   107→   107→  private pickerMeshes: (THREE.Mesh | undefined)[] = [];
+   108→   108→  private pickerGeometries: THREE.BufferGeometry[] = [];
+   109→   109→  private loadedChunks = new Set<number>();
+   110→   110→  private bounds3: THREE.Box3[] = [];
+   111→   111→  private centers: THREE.Vector3[] = [];
+   112→   112→  private systemOrder = new Map<SystemId, number>();
+   113→   113→
+   114→   114→  // Runtime
+   115→   115→  private state: EngineState | null = null;
+   116→   116→  private amount = 0;
+   117→   117→  private hoverIndex = -1;
+   118→   118→  private layout: ReturnType<typeof packInventory> | null = null;
+   119→   119→  private layoutKey = '';
+   120→   120→  private stage = new THREE.Group();
+   121→   121→  private gen = 0;
+   122→   122→  private disposed = false;
+   123→   123→  private frame = 0;
+   124→   124→  private dirty = true;
+   125→   125→  private tween: Tween | null = null;
+   126→   126→  private lastTime = performance.now();
+   127→   127→  private tap: Tap | null = null;
+   128→   128→  private lastClick = { id: '', t: 0 };
+   129→   129→  private hoverThrottle = 0;
+   130→   130→  private pendingFrameAfterLoad = false;
+   131→   131→  private lastReset = -1;
+   132→   132→  private lastFocus = -1;
+   133→   133→  private lastView: ViewId | '' = '';
+   134→   134→  private loadingKey = '';
+   135→   135→
+   136→   136→  constructor(host: HTMLElement, cb: EngineCallbacks) {
+   137→   137→    this.host = host;
+   138→   138→    this.cb = cb;
+   139→   139→    try {
+   140→   140→      this.renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+   141→   141→    } catch {
+   142→   142→      throw new Error('This browser could not start WebGL.');
+   143→   143→    }
+   144→   144→    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+   145→   145→    this.renderer.setClearColor(0x000000, 0);
+   146→   146→    this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
+   147→   147→    this.renderer.toneMappingExposure = 1.02;
+   148→   148→    this.renderer.domElement.style.width = '100%';
+   149→   149→    this.renderer.domElement.style.height = '100%';
+   150→   150→    this.renderer.domElement.style.display = 'block';
+   151→   151→    this.renderer.domElement.setAttribute(
+   152→   152→      'aria-label',
+   153→   153→      'Interactive 3D human anatomy. Drag to orbit, scroll to zoom, click a structure to inspect it.'
+   154→   154→    );
+   155→   155→    host.appendChild(this.renderer.domElement);
+   156→   156→
+   157→   157→    this.camera = new THREE.PerspectiveCamera(32, 1, 0.01, 100);
+   158→   158→    this.camera.position.set(1.35, 1.15, 3.3);
+   159→   159→    this.controls = new OrbitControls(this.camera, this.renderer.domElement);
+   160→   160→    this.controls.target.set(0, STAGE_Y, 0);
+   161→   161→    this.controls.enableDamping = true;
+   162→   162→    this.controls.dampingFactor = 0.08;
+   163→   163→    this.controls.minDistance = 0.06;
+   164→   164→    this.controls.maxDistance = 28;
+   165→   165→    this.controls.maxPolarAngle = Math.PI * 0.97;
+   166→   166→    this.controls.autoRotateSpeed = 0.8;
+   167→   167→    this.controls.addEventListener('change', () => {
+   168→   168→      this.dirty = true;
+   169→   169→    });
+   170→   170→
+   171→   171→    // Lighting matched to the AURA paper stage: warm key, mint rim.
+   172→   172→    this.scene.add(new THREE.HemisphereLight(0xf7f8f3, 0xc5d5c8, 1.05));
+   173→   173→    const key = new THREE.DirectionalLight(0xfff6ea, 1.35);
+   174→   174→    key.position.set(2.8, 4.4, 2.6);
+   175→   175→    this.scene.add(key);
+   176→   176→    const rim = new THREE.DirectionalLight(0xc1ebc9, 0.72);
+   177→   177→    rim.position.set(-2.8, 2.2, -2.4);
+   178→   178→    this.scene.add(rim);
+   179→   179→    const fill = new THREE.DirectionalLight(0xe7f3ea, 0.35);
+   180→   180→    fill.position.set(0.4, 1.2, 3.2);
+   181→   181→    this.scene.add(fill);
+   182→   182→
+   183→   183→    this.buildStage();
+   184→   184→    this.scene.add(this.stage);
+   185→   185→
+   186→   186→    const el = this.renderer.domElement;
+   187→   187→    el.addEventListener('pointerdown', this.onPointerDown);
+   188→   188→    el.addEventListener('pointermove', this.onPointerMove);
+   189→   189→    el.addEventListener('pointerup', this.onPointerUp);
+   190→   190→    el.addEventListener('pointercancel', this.onPointerCancel);
+   191→   191→    el.addEventListener('pointerleave', this.onPointerLeave);
+   192→   192→    this.resize();
+   193→   193→    this.animate();
+   194→   194→  }
+   195→   195→
+   196→   196→  // ---------------------------------------------------------------- stage --
+   197→   197→  private buildStage() {
+   198→   198→    const floor = new THREE.Mesh(
+   199→   199→      new THREE.CircleGeometry(30, 64),
+   200→   200→      new THREE.MeshStandardMaterial({ color: 0xe7f0e8, roughness: 1 })
+   201→   201→    );
+   202→   202→    floor.rotation.x = -Math.PI / 2;
+   203→   203→    floor.position.y = -0.02;
+   204→   204→    const platform = new THREE.Mesh(
+   205→   205→      new THREE.CylinderGeometry(0.62, 0.66, 0.02, 96),
+   206→   206→      new THREE.MeshStandardMaterial({ color: 0xf4f7f2, metalness: 0.04, roughness: 0.72 })
+   207→   207→    );
+   208→   208→    platform.position.y = -0.012;
+   209→   209→    const ring = new THREE.Mesh(
+   210→   210→      new THREE.RingGeometry(0.6, 0.612, 128),
+   211→   211→      new THREE.MeshBasicMaterial({ color: 0x24554b, transparent: true, opacity: 0.55, side: THREE.DoubleSide })
+   212→   212→    );
+   213→   213→    ring.rotation.x = -Math.PI / 2;
+   214→   214→    ring.position.y = 0.002;
+   215→   215→    const ring2 = new THREE.Mesh(
+   216→   216→      new THREE.RingGeometry(0.5, 0.508, 128),
+   217→   217→      new THREE.MeshBasicMaterial({ color: 0xc1ebc9, transparent: true, opacity: 0.95, side: THREE.DoubleSide })
+   218→   218→    );
+   219→   219→    ring2.rotation.x = -Math.PI / 2;
+   220→   220→    ring2.position.y = 0.002;
+   221→   221→    this.stage.add(floor, platform, ring, ring2);
+   222→   222→  }
+   223→   223→
+   224→   224→  // ------------------------------------------------------------- mounting --
+   225→   225→  /** Mount a (possibly different) atlas. Safe to call repeatedly. */
+   226→   226→  async setAtlas(manifestUrl: string, opts: { frameAfterLoad?: boolean } = {}) {
+   227→   227→    if (this.disposed) return;
+   228→   228→    this.pendingFrameAfterLoad = !!opts.frameAfterLoad;
+   229→   229→    if (this.manifestUrl === manifestUrl && this.atlas) return;
+   230→   230→    // Switch generation first so in-flight chunk mounts from the previous
+   231→   231→    // atlas stop; the geometry itself is torn down only after the new
+   232→   232→    // manifest resolves, so nothing can mount against half-swapped state.
+   233→   233→    const gen = ++this.gen;
+   234→   234→    this.manifestUrl = manifestUrl;
+   235→   235→    try {
+   236→   236→      const atlas = await this.library.manifest(manifestUrl);
+   237→   237→      if (gen !== this.gen || this.disposed) return;
+   238→   238→      this.teardownAtlas();
+   239→   239→      this.atlas = atlas;
+   240→   240→      this.partsByChunk.clear();
+   241→   241→      this.partIndex.clear();
+   242→   242→      atlas.parts.forEach((p, i) => {
+   243→   243→        this.partIndex.set(p.id, i);
+   244→   244→        const list = this.partsByChunk.get(p.chunk) ?? [];
+   245→   245→        list.push(p);
+   246→   246→        this.partsByChunk.set(p.chunk, list);
+   247→   247→      });
+   248→   248→      this.bounds3 = atlas.parts.map(
+   249→   249→        (p) => new THREE.Box3(new THREE.Vector3(...p.bounds[0]), new THREE.Vector3(...p.bounds[1]))
+   250→   250→      );
+   251→   251→      this.centers = this.bounds3.map((b) => b.getCenter(new THREE.Vector3()));
+   252→   252→      this.systemOrder = new Map(SYSTEM_META.map((s, i) => [s.id, i]));
+   253→   253→      this.stateWidth = Math.pow(2, Math.ceil(Math.log2(Math.max(2, atlas.parts.length))));
+   254→   254→      this.stateData = new Float32Array(this.stateWidth * 4);
+   255→   255→      this.selData = new Uint8Array(this.stateWidth * 4);
+   256→   256→      this.stateTexture?.dispose();
+   257→   257→      this.selTexture?.dispose();
+   258→   258→      this.stateTexture = new THREE.DataTexture(
+   259→   259→        this.stateData, this.stateWidth, 1, THREE.RGBAFormat, THREE.FloatType
+   260→   260→      );
+   261→   261→      this.selTexture = new THREE.DataTexture(this.selData, this.stateWidth, 1);
+   262→   262→      this.stateTexture.needsUpdate = true;
+   263→   263→      this.selTexture.needsUpdate = true;
+   264→   264→      this.hoverIndex = -1;
+   265→   265→      this.layout = null;
+   266→   266→      this.layoutKey = '';
+   267→   267→      // Re-run state against the new atlas.
+   268→   268→      if (this.state) this.setState(this.state);
+   269→   269→    } catch (e) {
+   270→   270→      if (gen === this.gen) this.cb.onError(e instanceof Error ? e.message : 'The atlas could not be loaded.');
+   271→   271→    }
+   272→   272→  }
+   273→   273→
+   274→   274→  private teardownAtlas() {
+   275→   275→    for (const m of this.batchMeshes) {
+   276→   276→      this.scene.remove(m);
+   277→   277→      m.geometry.dispose();
+   278→   278→    }
+   279→   279→    this.batchMeshes = [];
+   280→   280→    for (const g of this.pickerGeometries) g.dispose();
+   281→   281→    this.pickerGeometries = [];
+   282→   282→    this.pickerMeshes = [];
+   283→   283→    this.loadedChunks.clear();
+   284→   284→    this.materials.forEach((m) => m.dispose());
+   285→   285→    this.materials.clear();
+   286→   286→  }
+   287→   287→
+   288→   288→  private materialFor(system: SystemId): THREE.MeshStandardMaterial {
+   289→   289→    const existing = this.materials.get(system);
+   290→   290→    if (existing) return existing;
+   291→   291→    const meta = SYSTEM_MAP[system];
+   292→   292→    const color = new THREE.Color(meta?.color ?? "#8d9996");
+   293→   293→    const hsl = { h: 0, s: 0, l: 0 };
+   294→   294→    color.getHSL(hsl);
+   295→   295→    // Atlas swatches were tuned for a dark stage. Cap lightness so they
+   296→   296→    // stay readable on the paper viewport.
+   297→   297→    color.setHSL(hsl.h, Math.min(1, hsl.s * 1.08), Math.min(hsl.l, 0.58));
+   298→   298→    const mat = new THREE.MeshStandardMaterial({
+   299→   299→      color,
+   300→   300→      metalness: 0.04,
+   301→   301→      roughness: 0.62,
+   302→   302→      side: THREE.DoubleSide,
+   303→   303→      transparent: system === 'integumentary',
+   304→   304→      opacity: system === 'integumentary' ? 0.13 : 1,
+   305→   305→      depthWrite: system !== 'integumentary',
+   306→   306→    });
+   307→   307→    mat.onBeforeCompile = this.patchMaterial;
+   308→   308→    this.materials.set(system, mat);
+   309→   309→    return mat;
+   310→   310→  }
+   311→   311→
+   312→   312→  private patchMaterial = (shader: THREE.WebGLProgramParametersWithUniforms) => {
+   313→   313→    shader.uniforms.uState = { value: this.stateTexture };
+   314→   314→    shader.uniforms.uSel = { value: this.selTexture };
+   315→   315→    shader.uniforms.uStateW = { value: this.stateWidth };
+   316→   316→    shader.uniforms.uAccent = { value: ACCENT }; // shared, so setAccent() repaints every material
+   317→   317→    shader.vertexShader =
+   318→   318→      `attribute float partIndex;
+   319→   319→       uniform sampler2D uState;
+   320→   320→       uniform sampler2D uSel;
+   321→   321→       uniform float uStateW;
+   322→   322→       varying float vVis;
+   323→   323→       varying float vSel;
+   324→   324→      ` + shader.vertexShader;
+   325→   325→    shader.vertexShader = shader.vertexShader.replace(
+   326→   326→      '#include <begin_vertex>',
+   327→   327→      `#include <begin_vertex>
+   328→   328→       vec2 stUv = vec2((partIndex + 0.5) / uStateW, 0.5);
+   329→   329→       vec4 st = texture2D(uState, stUv);
+   330→   330→       transformed += st.xyz;
+   331→   331→       vVis = st.w;
+   332→   332→       vSel = texture2D(uSel, stUv).r;`
+   333→   333→    );
+   334→   334→    shader.fragmentShader =
+   335→   335→      `varying float vVis;
+   336→   336→       varying float vSel;
+   337→   337→       uniform vec3 uAccent;
+   338→   338→      ` + shader.fragmentShader;
+   339→   339→    shader.fragmentShader = shader.fragmentShader.replace(
+   340→   340→      '#include <clipping_planes_fragment>',
+   341→   341→      `#include <clipping_planes_fragment>
+   342→   342→       if (vVis < 0.5) discard;`
+   343→   343→    );
+   344→   344→    shader.fragmentShader = shader.fragmentShader.replace(
+   345→   345→      '#include <color_fragment>',
+   346→   346→      `#include <color_fragment>
+   347→   347→       float k = vSel > 0.9 ? 0.5 : vSel > 0.05 ? 0.22 : 0.0;
+   348→   348→       diffuseColor.rgb = mix(diffuseColor.rgb, uAccent, k);`
+   349→   349→    );
+   350→   350→  };
+   351→   351→
+   352→   352→  // -------------------------------------------------------------- loading --
+   353→   353→  private async ensureChunks(required: number[]) {
+   354→   354→    if (!this.atlas || this.disposed) return;
+   355→   355→    const gen = this.gen;
+   356→   356→    const atlas = this.atlas; // chunk queues serve exactly one atlas
+   357→   357→    const missing = required.filter((c) => !this.loadedChunks.has(c));
+   358→   358→    const key = required.join(',');
+   359→   359→    this.loadingKey = key;
+   360→   360→    if (missing.length === 0) {
+   361→   361→      this.cb.onProgress(null);
+   362→   362→      if (this.pendingFrameAfterLoad) {
+   363→   363→        this.pendingFrameAfterLoad = false;
+   364→   364→        this.frameVisible();
+   365→   365→      }
+   366→   366→      return;
+   367→   367→    }
+   368→   368→    let loaded = 0;
+   369→   369→    const total = missing.length;
+   370→   370→    this.cb.onProgress({ loaded: 0, total });
+   371→   371→    let cursor = 0;
+   372→   372→    const worker = async () => {
+   373→   373→      while (cursor < total) {
+   374→   374→        const ci = missing[cursor++];
+   375→   375→        try {
+   376→   376→          const buffer = await this.library.chunk(this.manifestUrl, atlas.chunks[ci]);
+   377→   377→          if (gen !== this.gen || this.disposed || this.atlas !== atlas) return;
+   378→   378→          this.mountChunk(ci, buffer, atlas);
+   379→   379→        } catch (e) {
+   380→   380→          if (gen === this.gen) {
+   381→   381→            this.cb.onError(e instanceof Error ? e.message : 'An anatomy file could not be loaded.');
+   382→   382→          }
+   383→   383→          return;
+   384→   384→        }
+   385→   385→        loaded++;
+   386→   386→        if (gen === this.gen && this.loadingKey === key) this.cb.onProgress({ loaded, total });
+   387→   387→      }
+   388→   388→    };
+   389→   389→    await Promise.all(Array.from({ length: Math.min(3, total) }, worker));
+   390→   390→    if (gen !== this.gen || this.disposed) return;
+   391→   391→    if (this.loadingKey === key) this.cb.onProgress(null);
+   392→   392→    if (this.pendingFrameAfterLoad) {
+   393→   393→      this.pendingFrameAfterLoad = false;
+   394→   394→      this.frameVisible();
+   395→   395→    }
+   396→   396→  }
+   397→   397→
+   398→   398→  private mountChunk(ci: number, buffer: ArrayBuffer, atlas: AtlasManifest) {
+   399→   399→    const parts = this.partsByChunk.get(ci);
+   400→   400→    if (!parts || this.loadedChunks.has(ci)) return;
+   401→   401→    this.loadedChunks.add(ci);
+   402→   402→    const groups = new Map<SystemId, { parts: Part[]; geoms: THREE.BufferGeometry[] }>();
+   403→   403→    parts.forEach((p) => {
+   404→   404→      const g = new THREE.BufferGeometry();
+   405→   405→      g.setAttribute(
+   406→   406→        'position',
+   407→   407→        new THREE.BufferAttribute(new Float32Array(buffer, p.positions, p.vertexCount * 3), 3)
+   408→   408→      );
+   409→   409→      g.setAttribute(
+   410→   410→        'normal',
+   411→   411→        new THREE.BufferAttribute(new Int16Array(buffer, p.normals, p.vertexCount * 3), 3, true)
+   412→   412→      );
+   413→   413→      g.setIndex(new THREE.BufferAttribute(new Uint32Array(buffer, p.indices, p.indexCount), 1));
+   414→   414→      g.setAttribute(
+   415→   415→        'partIndex',
+   416→   416→        new THREE.BufferAttribute(new Float32Array(p.vertexCount).fill(this.partIndex.get(p.id)!), 1)
+   417→   417→      );
+   418→   418→      const entry = groups.get(p.system) ?? { parts: [], geoms: [] };
+   419→   419→      entry.parts.push(p);
+   420→   420→      entry.geoms.push(g);
+   421→   421→      groups.set(p.system, entry);
+   422→   422→    });
+   423→   423→    groups.forEach((entry, system) => {
+   424→   424→      const merged = mergeGeometries(entry.geoms, false);
+   425→   425→      entry.geoms.forEach((g) => g.dispose()); // merged copies the bytes
+   426→   426→      if (!merged) return;
+   427→   427→      const mesh = new THREE.Mesh(merged, this.materialFor(system));
+   428→   428→      mesh.frustumCulled = false;
+   429→   429→      this.scene.add(mesh);
+   430→   430→      this.batchMeshes.push(mesh);
+   431→   431→      this.buildPickers(entry.parts, merged);
+   432→   432→    });
+   433→   433→    // The merged geometry now holds everything; the raw chunk buffer is dead
+   434→   434→    // weight, so hand it back for collection. Re-mounting re-fetches it.
+   435→   435→    this.library.release(this.manifestUrl, atlas.chunks[ci]);
+   436→   436→    this.dirty = true;
+   437→   437→    if (this.state) this.refreshState();
+   438→   438→  }
+   439→   439→
+   440→   440→  /** Zero-copy picking meshes: each shares the merged position array and a
+   441→   441→   *  slice of the merged index, with the part's own bounding sphere. They are
+   442→   442→   *  never rendered, so the shared arrays are never duplicated. */
+   443→   443→  private buildPickers(parts: Part[], merged: THREE.BufferGeometry) {
+   444→   444→    const pos = merged.getAttribute('position') as THREE.BufferAttribute;
+   445→   445→    const idx = merged.getIndex();
+   446→   446→    if (!idx) return;
+   447→   447→    const idxArr = idx.array as Uint32Array | Uint16Array;
+   448→   448→    const idxBuffer = idxArr.buffer as ArrayBuffer;
+   449→   449→    // mergeGeometries downsizes the index to 16-bit when a group is small
+   450→   450→    // enough, so the views must match its element size.
+   451→   451→    const IndexCtor = idxArr.BYTES_PER_ELEMENT === 4 ? Uint32Array : Uint16Array;
+   452→   452→    const stride = idxArr.BYTES_PER_ELEMENT;
+   453→   453→    let tCursor = 0;
+   454→   454→    for (const p of parts) {
+   455→   455→      const i = this.partIndex.get(p.id)!;
+   456→   456→      const pick = new THREE.BufferGeometry();
+   457→   457→      pick.setAttribute('position', new THREE.BufferAttribute(pos.array as Float32Array, 3));
+   458→   458→      pick.setIndex(
+   459→   459→        new THREE.BufferAttribute(
+   460→   460→          new IndexCtor(idxBuffer, idxArr.byteOffset + tCursor * stride, p.indexCount),
+   461→   461→          1
+   462→   462→        )
+   463→   463→      );
+   464→   464→      const sphere = new THREE.Sphere();
+   465→   465→      this.bounds3[i].getBoundingSphere(sphere);
+   466→   466→      pick.boundingSphere = sphere;
+   467→   467→      pick.boundingBox = this.bounds3[i].clone();
+   468→   468→      const mesh = new THREE.Mesh(pick);
+   469→   469→      mesh.matrixAutoUpdate = false;
+   470→   470→      mesh.updateMatrix();
+   471→   471→      mesh.updateMatrixWorld(true);
+   472→   472→      this.pickerMeshes[i] = mesh;
+   473→   473→      this.pickerGeometries.push(pick);
+   474→   474→      tCursor += p.indexCount;
+   475→   475→    }
+   476→   476→  }
+   477→   477→
+   478→   478→  // ---------------------------------------------------------------- state --
+   479→   479→  /** Tint used when a body system is emphasized. */
+   480→   480→  setAccent(hex: string) {
+   481→   481→    if (this.disposed) return;
+   482→   482→    ACCENT.set(hex);
+   483→   483→    this.dirty = true;
+   484→   484→  }
+   485→   485→
+   486→   486→  setState(next: EngineState) {
+   487→   487→    if (this.disposed) return;
+   488→   488→    const prev = this.state;
+   489→   489→    this.state = next;
+   490→   490→    if (!this.atlas) return;
+   491→   491→
+   492→   492→    // Load whatever chunks the current visibility needs. Cheap enough to run
+   493→   493→    // on every call; ensureChunks is a no-op when nothing is missing.
+   494→   494→    const needed = new Set<number>();
+   495→   495→    this.atlas.parts.forEach((p) => {
+   496→   496→      if (next.visible.includes(p.system) || next.selected.includes(p.id)) needed.add(p.chunk);
+   497→   497→    });
+   498→   498→    const missing = [...needed].filter((c) => !this.loadedChunks.has(c));
+   499→   499→    if (missing.length) void this.ensureChunks([...needed].sort((a, b) => a - b));
+   500→   500→
+   501→   501→    this.refreshState();
+   502→   502→
+   503→   503→    // Pull the camera back as the body explodes apart.
+   504→   504→    if (prev && prev.explode !== next.explode && !next.isolate) {
+   505→   505→      if (next.explode > 0.4) this.ensureLayout();
+   506→   506→      this.fit(next.view, next.explode);
+   507→   507→    }
+   508→   508→
+   509→   509→    if (next.reset !== this.lastReset) {
+   510→   510→      this.lastReset = next.reset;
+   511→   511→      this.amount = 0;
+   512→   512→      this.fit(next.view, 0);
+   513→   513→    } else if (next.view !== this.lastView) {
+   514→   514→      this.lastView = next.view;
+   515→   515→      this.fit(next.view, this.amount);
+   516→   516→    }
+   517→   517→    if (next.focus !== this.lastFocus) {
+   518→   518→      this.lastFocus = next.focus;
+   519→   519→      if (next.selected.length) this.frameSelection();
+   520→   520→    } else if (prev && prev.isolate !== next.isolate && next.isolate && next.selected.length) {
+   521→   521→      this.frameSelection();
+   522→   522→    }
+   523→   523→  }
+   524→   524→
+   525→   525→  private visiblePartIndices(): number[] {
+   526→   526→    const s = this.state;
+   527→   527→    if (!s || !this.atlas) return [];
+   528→   528→    const out: number[] = [];
+   529→   529→    const vis = new Set(s.visible);
+   530→   530→    const sel = new Set(s.selected);
+   531→   531→    this.atlas.parts.forEach((p, i) => {
+   532→   532→      if (s.isolate ? sel.has(p.id) : vis.has(p.system) || sel.has(p.id)) out.push(i);
+   533→   533→    });
+   534→   534→    return out;
+   535→   535→  }
+   536→   536→
+   537→   537→  /** Compute (or reuse) the inventory grid layout for the visible parts. */
+   538→   538→  private ensureLayout(visibleIdx?: number[]) {
+   539→   539→    if (!this.atlas) return;
+   540→   540→    const idx = visibleIdx ?? this.visiblePartIndices();
+   541→   541→    const aspect = Math.max(0.4, this.camera.aspect);
+   542→   542→    const key = idx.join(',') + ':' + aspect.toFixed(3);
+   543→   543→    if (key !== this.layoutKey) {
+   544→   544→      this.layout = packInventory(idx.map((i) => this.atlas!.parts[i]), aspect);
+   545→   545→      this.layoutKey = key;
+   546→   546→    }
+   547→   547→  }
+   548→   548→
+   549→   549→  private refreshState() {
+   550→   550→    const s = this.state;
+   551→   551→    if (!s || !this.atlas) return;
+   552→   552→    const vis = new Set(s.visible);
+   553→   553→    const sel = new Set(s.selected);
+   554→   554→    const isolate = s.isolate;
+   555→   555→    const emphasis = new Set(s.emphasis ?? []);
+   556→   556→    const emphasizing = emphasis.size > 0;
+   557→   557→    const visibleIdx = this.visiblePartIndices();
+   558→   558→
+   559→   559→    // Inventory layout for the exploded view.
+   560→   560→    if (this.amount > 0.45) this.ensureLayout(visibleIdx);
+   561→   561→
+   562→   562→    const nSys = SYSTEM_META.length;
+   563→   563→    const data = this.stateData;
+   564→   564→    const selData = this.selData;
+   565→   565→    for (let i = 0; i < this.atlas.parts.length; i++) {
+   566→   566→      const p = this.atlas.parts[i];
+   567→   567→      const visible = isolate ? sel.has(p.id) : vis.has(p.system) || sel.has(p.id);
+   568→   568→      const c = this.centers[i];
+   569→   569→      let dx = 0, dy = 0, dz = 0;
+   570→   570→      if (this.amount > 0.0005 && !isolate) {
+   571→   571→        const group = this.systemOrder.get(p.system) ?? 0;
+   572→   572→        const angle = (group / nSys) * Math.PI * 2;
+   573→   573→        const fanX = Math.sin(angle) * FAN_RADIUS;
+   574→   574→        const fanZ = Math.cos(angle) * FAN_RADIUS;
+   575→   575→        const fanY = (c.y - STAGE_Y) * 0.3;
+   576→   576→        if (this.amount <= 0.45) {
+   577→   577→          const t = this.amount / 0.45;
+   578→   578→          dx = fanX * t; dy = fanY * t; dz = fanZ * t;
+   579→   579→        } else {
+   580→   580→          const t = (this.amount - 0.45) / 0.55;
+   581→   581→          const cell = this.layout?.cells.get(p.id);
+   582→   582→          const gx = cell ? cell.x - c.x : 0;
+   583→   583→          const gy = cell ? cell.y + STAGE_Y - c.y : 0;
+   584→   584→          const gz = cell ? -c.z : 0;
+   585→   585→          dx = THREE.MathUtils.lerp(fanX, gx, t);
+   586→   586→          dy = THREE.MathUtils.lerp(fanY, gy, t);
+   587→   587→          dz = THREE.MathUtils.lerp(fanZ, gz, t);
+   588→   588→        }
+   589→   589→      }
+   590→   590→      const o = i * 4;
+   591→   591→      data[o] = dx; data[o + 1] = dy; data[o + 2] = dz; data[o + 3] = visible ? 1 : 0;
+   592→   592→      const focused = emphasizing && emphasis.has(p.system);
+   593→   593→      selData[o] = sel.has(p.id) || focused ? 255 : this.hoverIndex === i ? 140 : 0;
+   594→   594→      const mesh = this.pickerMeshes[i];
+   595→   595→      if (mesh) {
+   596→   596→        mesh.position.set(dx, dy, dz);
+   597→   597→        mesh.updateMatrix();
+   598→   598→        mesh.updateMatrixWorld(true);
+   599→   599→      }
+   600→   600→    }
+   601→   601→    this.stateTexture.needsUpdate = true;
+   602→   602→    this.selTexture.needsUpdate = true;
+   603→   603→
+   604→   604→    this.materials.forEach((mat, system) => {
+   605→   605→      const focused = !emphasizing || emphasis.has(system as SystemId);
+   606→   606→      const ghost = emphasizing && !focused && system !== "integumentary";
+   607→   607→      const nextOpacity = system === "integumentary" ? 0.13 : ghost ? 0.16 : 1;
+   608→   608→      const nextTransparent = system === "integumentary" || ghost;
+   609→   609→      if (mat.opacity !== nextOpacity || mat.transparent !== nextTransparent) {
+   610→   610→        mat.opacity = nextOpacity;
+   611→   611→        mat.transparent = nextTransparent;
+   612→   612→        mat.depthWrite = system !== "integumentary" && !ghost;
+   613→   613→        mat.needsUpdate = true;
+   614→   614→      }
+   615→   615→    });
+   616→   616→
+   617→   617→    // Grid view trades orbit for pan so the inventory can be browsed.
+   618→   618→    const grid = this.amount > 0.8 && !isolate;
+   619→   619→    this.controls.enableRotate = !grid;
+   620→   620→    this.controls.mouseButtons.LEFT = grid ? THREE.MOUSE.PAN : THREE.MOUSE.ROTATE;
+   621→   621→    this.controls.touches.ONE = grid ? THREE.TOUCH.PAN : THREE.TOUCH.ROTATE;
+   622→   622→    this.controls.autoRotate = !!s.autoRotate && !isolate && this.amount < 0.4;
+   623→   623→    this.stage.visible = this.amount < 0.5 && !isolate;
+   624→   624→    this.dirty = true;
+   625→   625→  }
+   626→   626→
+   627→   627→  // -------------------------------------------------------------- camera --
+   628→   628→  private fit(view: ViewId, extent: number) {
+   629→   629→    if (extent > 0.4) this.ensureLayout();
+   630→   630→    const el = this.renderer.domElement;
+   631→   631→    const w = el.clientWidth || 1;
+   632→   632→    const h = el.clientHeight || 1;
+   633→   633→    const aspect = w / h;
+   634→   634→    const fov = THREE.MathUtils.degToRad(this.camera.fov / 2);
+   635→   635→    const normalDistance = Math.max(2.6, (h / Math.max(160, h - 260)) * 3.1);
+   636→   636→    const packW = this.layout?.width ?? 0.6;
+   637→   637→    const packH = this.layout?.height ?? 1.7;
+   638→   638→    const atlasDistance =
+   639→   639→      Math.max(packH, packW / Math.max(0.4, aspect)) / (2 * Math.tan(fov)) * 1.18;
+   640→   640→    const distance = THREE.MathUtils.lerp(normalDistance, Math.max(0.3, atlasDistance), extent);
+   641→   641→    const dir =
+   642→   642→      extent > 0.6 || view === 'front' ? new THREE.Vector3(0, 0.03, 1)
+   643→   643→      : view === 'back' ? new THREE.Vector3(0, 0.03, -1)
+   644→   644→      : view === 'side' ? new THREE.Vector3(1, 0.03, 0)
+   645→   645→      : new THREE.Vector3(0.42, 0.1, 1).normalize();
+   646→   646→    const targetY = STAGE_Y;
+   647→   647→    this.tweenTo(targetY, dir, distance);
+   648→   648→  }
+   649→   649→
+   650→   650→  private tweenTo(targetY: number, dir: THREE.Vector3, distance: number) {
+   651→   651→    const target = new THREE.Vector3(0, targetY, 0);
+   652→   652→    const pos = target.clone().addScaledVector(dir, distance);
+   653→   653→    this.tween = {
+   654→   654→      fromPos: this.camera.position.clone(),
+   655→   655→      toPos: pos,
+   656→   656→      fromTarget: this.controls.target.clone(),
+   657→   657→      toTarget: target,
+   658→   658→      t: 0,
+   659→   659→      dur: 0.65,
+   660→   660→    };
+   661→   661→  }
+   662→   662→
+   663→   663→  frameSelection() {
+   664→   664→    const s = this.state;
+   665→   665→    if (!s || !s.selected.length || !this.atlas) return;
+   666→   666→    const box = new THREE.Box3();
+   667→   667→    s.selected.forEach((id) => {
+   668→   668→      const i = this.partIndex.get(id);
+   669→   669→      if (i === undefined) return;
+   670→   670→      const b = this.bounds3[i].clone();
+   671→   671→      const o = this.stateData;
+   672→   672→      b.translate(new THREE.Vector3(o[i * 4], o[i * 4 + 1], o[i * 4 + 2]));
+   673→   673→      box.union(b);
+   674→   674→    });
+   675→   675→    if (box.isEmpty()) return;
+   676→   676→    this.frameBox(box, 1.25);
+   677→   677→  }
+   678→   678→
+   679→   679→  frameVisible() {
+   680→   680→    const box = new THREE.Box3();
+   681→   681→    this.visiblePartIndices().forEach((i) => box.union(this.bounds3[i]));
+   682→   682→    if (box.isEmpty()) return;
+   683→   683→    this.frameBox(box, 1.12);
+   684→   684→  }
+   685→   685→
+   686→   686→  private frameBox(box: THREE.Box3, margin: number) {
+   687→   687→    const el = this.renderer.domElement;
+   688→   688→    const w = el.clientWidth || 1;
+   689→   689→    const h = el.clientHeight || 1;
+   690→   690→    const size = box.getSize(new THREE.Vector3());
+   691→   691→    const center = box.getCenter(new THREE.Vector3());
+   692→   692→    const fov = THREE.MathUtils.degToRad(this.camera.fov / 2);
+   693→   693→    const distance =
+   694→   694→      Math.max(size.y, size.x / Math.max(0.4, w / h), size.z * 0.7) / (2 * Math.tan(fov)) * margin;
+   695→   695→    const dir = this.camera.position.clone().sub(this.controls.target).normalize();
+   696→   696→    if (!Number.isFinite(dir.length()) || dir.length() < 0.01) dir.set(0.42, 0.1, 1).normalize();
+   697→   697→    this.tween = {
+   698→   698→      fromPos: this.camera.position.clone(),
+   699→   699→      toPos: center.clone().addScaledVector(dir, Math.max(0.08, distance)),
+   700→   700→      fromTarget: this.controls.target.clone(),
+   701→   701→      toTarget: center,
+   702→   702→      t: 0,
+   703→   703→      dur: 0.8,
+   704→   704→    };
+   705→   705→  }
+   706→   706→
+   707→   707→  // ------------------------------------------------------------- picking --
+   708→   708→  private raycaster = new THREE.Raycaster();
+   709→   709→  private pointer = new THREE.Vector2();
+   710→   710→  private worldBox = new THREE.Box3();
+   711→   711→  private hitPoint = new THREE.Vector3();
+   712→   712→
+   713→   713→  private pickAt(clientX: number, clientY: number): number {
+   714→   714→    if (!this.atlas) return -1;
+   715→   715→    const el = this.renderer.domElement;
+   716→   716→    const rect = el.getBoundingClientRect();
+   717→   717→    this.pointer.set(
+   718→   718→      ((clientX - rect.left) / rect.width) * 2 - 1,
+   719→   719→      -((clientY - rect.top) / rect.height) * 2 + 1
+   720→   720→    );
+   721→   721→    this.raycaster.setFromCamera(this.pointer, this.camera);
+   722→   722→    const visibleIdx = new Set(this.visiblePartIndices());
+   723→   723→    const hasSolid = [...visibleIdx].some(
+   724→   724→      (i) => this.atlas!.parts[i].system !== 'integumentary'
+   725→   725→    );
+   726→   726→    let best = -1;
+   727→   727→    let bestDist = Infinity;
+   728→   728→    this.pickerMeshes.forEach((mesh, i) => {
+   729→   729→      if (!mesh || !visibleIdx.has(i)) return;
+   730→   730→      const p = this.atlas!.parts[i];
+   731→   731→      if (p.system === 'integumentary' && hasSolid) return;
+   732→   732→      const o = this.stateData;
+   733→   733→      this.worldBox.copy(this.bounds3[i]).translate(new THREE.Vector3(o[i * 4], o[i * 4 + 1], o[i * 4 + 2]));
+   734→   734→      if (!this.raycaster.ray.intersectBox(this.worldBox, this.hitPoint)) return;
+   735→   735→      const hits = this.raycaster.intersectObject(mesh, false);
+   736→   736→      if (hits.length && hits[0].distance < bestDist) {
+   737→   737→        bestDist = hits[0].distance;
+   738→   738→        best = i;
+   739→   739→      }
+   740→   740→    });
+   741→   741→    return best;
+   742→   742→  }
+   743→   743→
+   744→   744→  private onPointerDown = (e: PointerEvent) => {
+   745→   745→    this.tap = {
+   746→   746→      x: e.clientX,
+   747→   747→      y: e.clientY,
+   748→   748→      pointerId: e.pointerId,
+   749→   749→      drag: false,
+   750→   750→      threshold: e.pointerType === 'touch' ? 12 : 6,
+   751→   751→    };
+   752→   752→    this.cb.onHover(null);
+   753→   753→    this.dirty = true;
+   754→   754→  };
+   755→   755→
+   756→   756→  private onPointerMove = (e: PointerEvent) => {
+   757→   757→    if (this.tap) {
+   758→   758→      if (
+   759→   759→        this.tap.pointerId === e.pointerId &&
+   760→   760→        Math.hypot(e.clientX - this.tap.x, e.clientY - this.tap.y) > this.tap.threshold
+   761→   761→      ) {
+   762→   762→        this.tap.drag = true;
+   763→   763→      }
+   764→   764→      return;
+   765→   765→    }
+   766→   766→    if (e.pointerType === 'touch' || e.buttons) return;
+   767→   767→    const now = performance.now();
+   768→   768→    if (now - this.hoverThrottle < 60) return;
+   769→   769→    this.hoverThrottle = now;
+   770→   770→    const i = this.pickAt(e.clientX, e.clientY);
+   771→   771→    if (i !== this.hoverIndex) {
+   772→   772→      this.hoverIndex = i;
+   773→   773→      this.refreshState();
+   774→   774→      this.renderer.domElement.style.cursor = i >= 0 ? 'pointer' : 'grab';
+   775→   775→    }
+   776→   776→    if (i >= 0 && this.atlas) {
+   777→   777→      const rect = this.renderer.domElement.getBoundingClientRect();
+   778→   778→      this.cb.onHover({
+   779→   779→        id: this.atlas.parts[i].id,
+   780→   780→        name: this.atlas.parts[i].name,
+   781→   781→        system: this.atlas.parts[i].system,
+   782→   782→        x: e.clientX - rect.left,
+   783→   783→        y: e.clientY - rect.top,
+   784→   784→      });
+   785→   785→    } else {
+   786→   786→      this.cb.onHover(null);
+   787→   787→    }
+   788→   788→  };
+   789→   789→
+   790→   790→  private onPointerUp = (e: PointerEvent) => {
+   791→   791→    const tap = this.tap;
+   792→   792→    this.tap = null;
+   793→   793→    if (!tap || tap.drag || tap.pointerId !== e.pointerId) return;
+   794→   794→    const i = this.pickAt(e.clientX, e.clientY);
+   795→   795→    const id = i >= 0 && this.atlas ? this.atlas.parts[i].id : null;
+   796→   796→    const now = performance.now();
+   797→   797→    if (id && id === this.lastClick.id && now - this.lastClick.t < 400) {
+   798→   798→      this.lastClick = { id: '', t: 0 };
+   799→   799→      this.cb.onActivate(id);
+   800→   800→    } else {
+   801→   801→      this.lastClick = { id: id ?? '', t: now };
+   802→   802→      this.cb.onPick(id, i >= 0 && this.atlas ? this.atlas.parts[i].system : undefined);
+   803→   803→    }
+   804→   804→  };
+   805→   805→
+   806→   806→  private onPointerCancel = () => {
+   807→   807→    this.tap = null;
+   808→   808→  };
+   809→   809→
+   810→   810→  private onPointerLeave = () => {
+   811→   811→    this.tap = null;
+   812→   812→    if (this.hoverIndex >= 0) {
+   813→   813→      this.hoverIndex = -1;
+   814→   814→      this.refreshState();
+   815→   815→    }
+   816→   816→    this.cb.onHover(null);
+   817→   817→  };
+   818→   818→
+   819→   819→  // ------------------------------------------------------------- lifecycle --
+   820→   820→  private resize() {
+   821→   821→    const w = this.host.clientWidth || 1;
+   822→   822→    const h = this.host.clientHeight || 1;
+   823→   823→    this.camera.aspect = w / h;
+   824→   824→    this.camera.updateProjectionMatrix();
+   825→   825→    this.renderer.setSize(w, h, false);
+   826→   826→    this.dirty = true;
+   827→   827→  }
+   828→   828→
+   829→   829→  private resizeObserver?: ResizeObserver;
+   830→   830→
+   831→   831→  attachResizeObserver() {
+   832→   832→    this.resizeObserver = new ResizeObserver(() => {
+   833→   833→      this.resize();
+   834→   834→      this.layoutKey = ''; // repack for the new aspect
+   835→   835→      if (this.state) this.refreshState();
+   836→   836→    });
+   837→   837→    this.resizeObserver.observe(this.host);
+   838→   838→  }
+   839→   839→
+   840→   840→  private animate = () => {
+   841→   841→    if (this.disposed) return;
+   842→   842→    this.frame = requestAnimationFrame(this.animate);
+   843→   843→    const now = performance.now();
+   844→   844→    const dt = Math.min((now - this.lastTime) / 1000, 0.05);
+   845→   845→    this.lastTime = now;
+   846→   846→    if (this.state && Math.abs(this.amount - this.state.explode) > 0.0005) {
+   847→   847→      this.amount = THREE.MathUtils.damp(this.amount, this.state.explode, 7, dt);
+   848→   848→      this.refreshState();
+   849→   849→    }
+   850→   850→    if (this.tween) {
+   851→   851→      this.tween.t = Math.min(1, this.tween.t + dt / this.tween.dur);
+   852→   852→      const e = 1 - Math.pow(1 - this.tween.t, 3); // ease-out cubic
+   853→   853→      this.camera.position.lerpVectors(this.tween.fromPos, this.tween.toPos, e);
+   854→   854→      this.controls.target.lerpVectors(this.tween.fromTarget, this.tween.toTarget, e);
+   855→   855→      if (this.tween.t >= 1) this.tween = null;
+   856→   856→      this.dirty = true;
+   857→   857→    }
+   858→   858→    this.controls.update();
+   859→   859→    if (this.dirty) {
+   860→   860→      this.renderer.render(this.scene, this.camera);
+   861→   861→      this.dirty = false;
+   862→   862→    }
+   863→   863→  };
+   864→   864→
+   865→   865→  dispose() {
+   866→   866→    this.disposed = true;
+   867→   867→    cancelAnimationFrame(this.frame);
+   868→   868→    this.resizeObserver?.disconnect();
+   869→   869→    const el = this.renderer.domElement;
+   870→   870→    el.removeEventListener('pointerdown', this.onPointerDown);
+   871→   871→    el.removeEventListener('pointermove', this.onPointerMove);
+   872→   872→    el.removeEventListener('pointerup', this.onPointerUp);
+   873→   873→    el.removeEventListener('pointercancel', this.onPointerCancel);
+   874→   874→    el.removeEventListener('pointerleave', this.onPointerLeave);
+   875→   875→    this.controls.dispose();
+   876→   876→    this.teardownAtlas();
+   877→   877→    this.stateTexture?.dispose();
+   878→   878→    this.selTexture?.dispose();
+   879→   879→    this.scene.traverse((o) => {
+   880→   880→      if (o instanceof THREE.Mesh) {
+   881→   881→        o.geometry.dispose();
+   882→   882→        const mats = Array.isArray(o.material) ? o.material : [o.material];
+   883→   883→        mats.forEach((m) => m.dispose());
+   884→   884→      }
+   885→   885→    });
+   886→   886→    this.renderer.dispose();
+   887→   887→    el.remove();
+   888→   888→  }
+   889→   889→}
+   890→   890→
