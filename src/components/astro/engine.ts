@@ -5,11 +5,11 @@
  * clock, which only advances while the game is unpaused, so every stealth
  * reaction-time measurement stays honest even if the tab is backgrounded.
  *
- * The 120-second DIRECTOR schedules the clinical events described in the
+ * The 40-second DIRECTOR schedules the clinical events described in the
  * mission spec:
- *   · PVT meteoroids at randomized 2–10 s intervals (25 % fake warnings)
- *   · two 8 s quiet stretches ending in a peripheral radar ping
- *   · two 15 s magnetic interference zones (inverted controls)
+ *   · PVT meteoroids at randomized 1.8–5 s intervals (25 % fake warnings)
+ *   · two ~3 s quiet stretches ending in a peripheral radar ping
+ *   · two 5 s magnetic interference zones (inverted controls)
  *   · a mid-run fork: Safe Route (+50) vs Storm Route (+200, fast & chaotic)
  *
  * All gameplay events flow into the Recorder (assessment.ts); the engine
@@ -22,7 +22,7 @@ import { Recorder, loadSessions, type SessionLog, type RouteChoice } from './ass
 import { sfx } from './audio';
 import type { BannerTone, HudState, RadarPingState } from './store';
 
-export const RUN_SECONDS = 120;
+export const RUN_SECONDS = 40;
 
 export interface EngineCallbacks {
   onHud: (patch: Partial<HudState>) => void;
@@ -139,10 +139,10 @@ export class AstroEngine {
 
   // director state
   private fired = new Set<string>();
-  private nextPvtAt = 6000;
-  private nextCrystalAt = 2500;
-  private nextPodAt = 9000;
-  private nextDebrisAt = 6000;
+  private nextPvtAt = 4500;
+  private nextCrystalAt = 1500;
+  private nextPodAt = 8500;
+  private nextDebrisAt = 7000;
   private fakeWindowUntil = -1;
   private radarActive = false;
   private radarOnsetAt = 0;
@@ -557,10 +557,10 @@ export class AstroEngine {
     this.routeMult = 1;
     this.finaleBoost = 1;
     this.fired.clear();
-    this.nextPvtAt = 6000 + Math.random() * 3000;
-    this.nextCrystalAt = 2500;
-    this.nextPodAt = 9000 + Math.random() * 3000;
-    this.nextDebrisAt = 6500;
+    this.nextPvtAt = 4500 + Math.random() * 1000;
+    this.nextCrystalAt = 1500;
+    this.nextPodAt = 8500 + Math.random() * 1500;
+    this.nextDebrisAt = 7000;
     this.fakeWindowUntil = -1;
     this.radarActive = false;
     this.forkOpenUntil = -1;
@@ -597,7 +597,9 @@ export class AstroEngine {
     }
     if (this.gateSafe) {
       this.gateSafe.visible = false;
-      this.gateStorm.visible = false;
+      if (this.gateStorm) {
+        this.gateStorm.visible = false;
+      }
     }
     this.syncHud(true);
   }
@@ -862,7 +864,7 @@ export class AstroEngine {
       this.world.setStorm(true);
       this.cb.onBanner('STORM ROUTE +200', 'warn', 1800, '×2 scoring · heavy debris');
     }
-    this.routeSegmentEnd = at + 21000;
+    this.routeSegmentEnd = at + 6000;
     sfx.route(choice);
     this.syncHud(true);
   }
@@ -1025,13 +1027,13 @@ export class AstroEngine {
    *  flowing during quiet stretches. */
   private inExclusion(at: number, kind: 'hazard' | 'pickup', pad = 0): boolean {
     const hazardWindows: [number, number][] = [
-      [33000 - pad, 45500], // quiet #1 → radar ping #1
-      [44000, 59500], // magnetic #1
-      [61500 - pad, 66500], // fork + gates
-      [84000 - pad, 93000], // quiet #2 → radar ping #2
-      [95500, 111500], // magnetic #2
+      [10000 - pad, 14500], // quiet #1 → radar ping #1
+      [14000, 19000], // magnetic #1
+      [19500 - pad, 24500], // fork + gates
+      [26000 - pad, 30500], // quiet #2 → radar ping #2
+      [31000, 36000], // magnetic #2
     ];
-    const pickupWindows: [number, number][] = [[61500 - pad, 66500]];
+    const pickupWindows: [number, number][] = [[19500 - pad, 24500]];
     const windows = kind === 'hazard' ? hazardWindows : pickupWindows;
     return windows.some(([a, b]) => at >= a && at <= b);
   }
@@ -1075,34 +1077,34 @@ export class AstroEngine {
         this.recorder.stimulusOnset('pvt', at);
         sfx.warn();
       }
-      let gap = 2000 + Math.random() * 8000;
+      let gap = 1800 + Math.random() * 3200;
       // keep the schedule out of exclusion zones
       let guard = 0;
-      while (this.inExclusion(at + gap, 'hazard', 1200) && guard++ < 30) gap += 1500;
+      while (this.inExclusion(at + gap, 'hazard', 1200) && guard++ < 30) gap += 700;
       // guarantee a minimum number of real trials
-      if (at > 95000 && this.realTrials < 8) gap = Math.min(gap, 2600);
+      if (at > 30000 && this.realTrials < 5) gap = Math.min(gap, 1800);
       this.nextPvtAt = at + gap;
     }
 
     // --- quiet stretch → radar ping #1 ---------------------------------------
-    if (at >= 33000) once('quiet1', () => this.cb.onBanner('CLEAR SECTOR', 'info', 1600, 'stay sharp'));
-    if (at >= 41000 && !this.fired.has('radar1')) {
+    if (at >= 10000) once('quiet1', () => this.cb.onBanner('CLEAR SECTOR', 'info', 1600, 'stay sharp'));
+    if (at >= 11500 && !this.fired.has('radar1')) {
       this.fired.add('radar1');
       this.openRadar();
     }
 
     // --- magnetic zone #1 ------------------------------------------------------
-    if (at >= 44000 && !this.fired.has('mag1')) {
+    if (at >= 14000 && !this.fired.has('mag1')) {
       this.fired.add('mag1');
       this.startMagnetic();
     }
-    if (at >= 59500 && this.fired.has('mag1') && !this.fired.has('mag1end')) {
+    if (at >= 19000 && this.fired.has('mag1') && !this.fired.has('mag1end')) {
       this.fired.add('mag1end');
       this.endMagnetic();
     }
 
     // --- fork -------------------------------------------------------------------
-    if (at >= 62000 && !this.fired.has('fork')) {
+    if (at >= 19800 && !this.fired.has('fork')) {
       this.fired.add('fork');
       this.forkChosen = null;
       this.forkOpenUntil = at + FORK_WINDOW;
@@ -1115,7 +1117,7 @@ export class AstroEngine {
       this.recorder.routeChosen('timeout', at);
       this.forkChosen = 'timeout';
       this.routeMult = 0.85;
-      this.routeSegmentEnd = at + 21000;
+      this.routeSegmentEnd = at + 6000;
       this.cb.onForkClose();
       this.cb.onBanner('AUTOPILOT: SAFE ROUTE', 'info', 1600);
     }
@@ -1131,23 +1133,23 @@ export class AstroEngine {
     }
 
     // --- quiet stretch → radar ping #2 ------------------------------------------
-    if (at >= 90000 && !this.fired.has('radar2')) {
+    if (at >= 28000 && !this.fired.has('radar2')) {
       this.fired.add('radar2');
       this.openRadar();
     }
 
     // --- magnetic zone #2 ----------------------------------------------------------
-    if (at >= 96000 && !this.fired.has('mag2')) {
+    if (at >= 31000 && !this.fired.has('mag2')) {
       this.fired.add('mag2');
       this.startMagnetic();
     }
-    if (at >= 111000 && this.fired.has('mag2') && !this.fired.has('mag2end')) {
+    if (at >= 36000 && this.fired.has('mag2') && !this.fired.has('mag2end')) {
       this.fired.add('mag2end');
       this.endMagnetic();
     }
 
     // --- finale -------------------------------------------------------------------
-    if (at >= 111000) {
+    if (at >= 36000) {
       once('finale', () => {
         this.finaleBoost = 1.12;
         this.cb.onBanner('FINAL SPRINT', 'magic', 1800, 'everything counts double now');
@@ -1174,7 +1176,7 @@ export class AstroEngine {
     this.inverted = true;
     this.world.setMagnetic(true);
     this.recorder.magneticStart(this.runMs);
-    this.cb.onBanner('MAGNETIC INTERFERENCE', 'magic', 2400, 'controls are inverted — 15 s');
+    this.cb.onBanner('MAGNETIC INTERFERENCE', 'magic', 2400, 'controls are inverted — 5 s');
     this.shake = Math.max(this.shake, 0.4);
     sfx.magnetic();
     this.syncHud(true);
@@ -1194,10 +1196,14 @@ export class AstroEngine {
       this.gateStorm = this.makeGate(0xff8a3a);
       this.scene.add(this.gateSafe, this.gateStorm);
     }
-    this.gateSafe.position.set(-6.2, 4.2, -150);
-    this.gateStorm.position.set(6.2, 4.2, -150);
-    this.gateSafe.visible = true;
-    this.gateStorm.visible = true;
+this.gateSafe.position.set(-6.2, 4.2, -150);
+if (this.gateStorm) {
+  this.gateStorm.position.set(6.2, 4.2, -150);
+}
+this.gateSafe.visible = true;
+if (this.gateStorm) {
+  this.gateStorm.visible = true;
+}
   }
 
   // ---------------------------------------------------------------- loop --
@@ -1240,7 +1246,7 @@ export class AstroEngine {
       this.runMs += dt * 1000;
       this.director();
       const target =
-        (26 + Math.min(14, (this.runMs / 1000) * 0.12)) * this.routeMult * this.finaleBoost;
+        (26 + Math.min(14, (this.runMs / 1000) * 0.35)) * this.routeMult * this.finaleBoost;
       this.speed += (target - this.speed) * Math.min(1, dt * 0.9);
       this.topSpeed = Math.max(this.topSpeed, this.speed);
       this.updateDriving(dt);
@@ -1332,15 +1338,15 @@ export class AstroEngine {
     const at = this.runMs;
     if (at >= this.nextCrystalAt && !this.inExclusion(at, 'pickup', 300)) {
       this.spawnCrystalTrail();
-      this.nextCrystalAt = at + (this.stormOn ? 1500 + Math.random() * 900 : 2200 + Math.random() * 1600);
+      this.nextCrystalAt = at + (this.stormOn ? 900 + Math.random() * 600 : 1200 + Math.random() * 1000);
     }
     if (at >= this.nextPodAt && !this.inExclusion(at, 'pickup', 300)) {
       this.spawnPod();
-      this.nextPodAt = at + 9000 + Math.random() * 5000;
+      this.nextPodAt = at + 6000 + Math.random() * 3000;
     }
-    if (at >= this.nextDebrisAt && !this.inExclusion(at, 'hazard', 300) && at > 12000) {
+    if (at >= this.nextDebrisAt && !this.inExclusion(at, 'hazard', 300) && at > 6500) {
       this.spawnDebris();
-      this.nextDebrisAt = at + (this.stormOn ? 2200 + Math.random() * 1500 : 4200 + Math.random() * 3000);
+      this.nextDebrisAt = at + (this.stormOn ? 1300 + Math.random() * 900 : 2400 + Math.random() * 1600);
     }
   }
 

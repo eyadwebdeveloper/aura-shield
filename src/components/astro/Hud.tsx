@@ -48,7 +48,7 @@ function TimerRing({ left }: { left: number }) {
   const R = 26;
   const C = 2 * Math.PI * R;
   const frac = Math.max(0, Math.min(1, left / RUN_SECONDS));
-  const danger = left <= 20;
+  const danger = left <= 8;
   return (
     <div className="relative h-16 w-16" role="timer" aria-label={`${Math.ceil(left)} seconds remaining`}>
       <svg viewBox="0 0 64 64" className="h-16 w-16 -rotate-90">
@@ -67,7 +67,7 @@ function TimerRing({ left }: { left: number }) {
         />
       </svg>
       <div
-        className={`absolute inset-0 flex items-center justify-center font-mono text-sm font-bold tabular-nums ${
+        className={`absolute inset-0 flex items-center justify-center font-display text-lg font-bold tabular-nums ${
           danger ? 'text-red-300' : 'text-zinc-100'
         }`}
       >
@@ -119,7 +119,7 @@ function ForkChoice() {
         animate={{ y: 0, opacity: 1 }}
         className="rounded-2xl border border-white/15 bg-[#0c1219]/90 px-5 py-2.5 text-center backdrop-blur-md"
       >
-        <div className="flex items-center gap-2 text-sm font-bold tracking-[0.2em] text-zinc-100">
+        <div className="flex items-center gap-2 font-display text-sm font-semibold tracking-[0.2em] text-zinc-100">
           <Route size={15} className="text-amber-300" /> FORK AHEAD — CHOOSE IN 2 SECONDS
         </div>
         <div className="mt-2 h-1 w-56 overflow-hidden rounded-full bg-white/10">
@@ -288,9 +288,9 @@ export default function Hud() {
 
       {/* top-left: score */}
       <div className="absolute left-4 top-3 flex flex-col gap-2 sm:left-6">
-        <div className="rounded-2xl border border-white/10 bg-[#0c1219]/80 px-4 py-2.5 backdrop-blur-md">
-          <div className="text-[10px] font-bold uppercase tracking-[0.22em] text-zinc-500">Score</div>
-          <div className="font-mono text-2xl font-black tabular-nums text-zinc-50">
+        <div className="hud-glass rounded-2xl px-4 py-2.5">
+          <div className="font-display text-[10.5px] font-semibold uppercase tracking-[0.24em] text-zinc-400">Score</div>
+          <div className="font-display text-3xl font-bold tabular-nums text-zinc-50">
             {hud.score.toLocaleString()}
           </div>
         </div>
@@ -315,14 +315,14 @@ export default function Hud() {
 
       {/* top-right: energy + telemetry + buttons */}
       <div className="absolute right-4 top-3 flex flex-col items-end gap-2 sm:right-6">
-        <div className="rounded-2xl border border-white/10 bg-[#0c1219]/80 px-4 py-2.5 backdrop-blur-md">
+        <div className="hud-glass rounded-2xl px-4 py-2.5">
           <div className="flex items-center gap-2">
             {hud.energy > 25 ? (
               <Shield size={14} className="text-teal-300" />
             ) : (
               <ShieldAlert size={14} className="animate-pulse text-red-400" />
             )}
-            <span className="text-[10px] font-bold uppercase tracking-[0.22em] text-zinc-500">Shield</span>
+            <span className="font-display text-[10.5px] font-semibold uppercase tracking-[0.24em] text-zinc-400">Shield</span>
             <span className="font-mono text-xs font-bold tabular-nums text-zinc-300">{hud.energy}%</span>
           </div>
           <div className="mt-1.5 h-1.5 w-32 overflow-hidden rounded-full bg-white/10">
@@ -371,7 +371,7 @@ export default function Hud() {
               initial={{ y: -14, opacity: 0, scale: 0.95 }}
               animate={{ y: 0, opacity: 1, scale: 1 }}
               exit={{ y: -10, opacity: 0 }}
-              className={`rounded-xl border px-4 py-2 text-center text-[13px] font-bold tracking-wide backdrop-blur-md ${TONE_STYLES[b.tone]}`}
+              className={`rounded-xl border px-4 py-2 text-center font-display text-[14px] font-semibold uppercase tracking-[0.1em] backdrop-blur-md shadow-[0_8px_24px_-10px_rgba(0,0,0,0.8)] ${TONE_STYLES[b.tone]}`}
             >
               {b.text}
               {b.sub && <div className="mt-0.5 text-[10px] font-medium opacity-70">{b.sub}</div>}
@@ -435,13 +435,13 @@ export default function Hud() {
               className="text-center"
             >
               <div
-                className={`font-mono text-[7rem] font-black leading-none ${
+                className={`font-display text-[8rem] font-bold leading-none glow-teal ${
                   countdown === 0 ? 'text-teal-300' : 'text-zinc-50'
                 }`}
               >
                 {countdown === 0 ? 'GO' : countdown}
               </div>
-              <div className="mt-2 text-xs font-bold tracking-[0.3em] text-zinc-400">
+              <div className="mt-3 font-display text-sm font-semibold tracking-[0.4em] text-zinc-300">
                 {countdown === 0 ? 'SHIELD THE HABITAT' : 'PREPARE FOR LAUNCH'}
               </div>
             </motion.div>
@@ -460,7 +460,7 @@ export default function Hud() {
           >
             <div className="pointer-events-auto flex flex-col items-center gap-4 rounded-3xl border border-white/10 bg-[#0c1219]/95 px-10 py-8 text-center">
               <RotateCcw size={22} className="text-zinc-500" />
-              <div className="text-lg font-black tracking-[0.24em] text-zinc-100">PAUSED</div>
+              <div className="font-display text-xl font-bold tracking-[0.3em] text-zinc-100">PAUSED</div>
               <p className="max-w-56 text-xs leading-relaxed text-zinc-500">
                 The mission clock is frozen — reaction measurements resume only when you do.
               </p>

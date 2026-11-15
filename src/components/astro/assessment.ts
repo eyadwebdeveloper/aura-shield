@@ -361,7 +361,7 @@ export class Recorder {
         kind: t.kind,
         onsetAt: Math.round(t.onsetAt),
         rt: t.rt,
-        outcome: t.outcome,
+        outcome: t.outcome === 'pending' ? 'miss' : t.outcome,
       })),
       fakeWarnings: this.fakeWarnings,
       falseStarts: this.falseStarts,
@@ -661,14 +661,14 @@ export function saveRun(log: SessionLog): RunReport {
   if (
     metrics.motivation.engagementDelta != null &&
     metrics.motivation.engagementDelta < 0.5 &&
-    log.durationMs > 60000
+    log.durationMs > 20000
   ) {
     flags.push({
       id: 'ENGAGE',
       level: 'watch',
       title: 'Engagement faded late in the run',
       detail:
-        'Pickup rate dropped by more than half in the second minute while the game kept offering rewards — a soft signal of fatigue or low vigor (POMS Vigor/Fatigue).',
+        'Pickup rate dropped by more than half in the second half of the run while the game kept offering rewards — a soft signal of fatigue or low vigor (POMS Vigor/Fatigue).',
     });
   }
 

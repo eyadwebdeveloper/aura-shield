@@ -5,7 +5,8 @@
 import { useEffect, useRef } from 'react';
 import { AstroEngine } from './engine';
 import { engineRef, useAstro } from './store';
-import { saveRun } from './assessment';
+import { loadSessions, saveRun } from './assessment';
+import { assessRun } from './ai';
 
 export default function GameCanvas() {
   const hostRef = useRef<HTMLDivElement>(null);
@@ -26,8 +27,26 @@ export default function GameCanvas() {
         onEnd: (log) => {
           try {
             const report = saveRun(log);
-            useAstro.getState().setReport(report);
-            useAstro.getState().bumpRunsToday();
+            const st = useAstro.getState();
+            st.setReport(report);
+            st.bumpRunsToday();
+            // Hand the finished run to the backend AI. The results screen shows
+            // a live "analysing" state and falls back to the on-device rules
+            // engine if the backend is unreachable.
+            st.setAi(null, 'loading');
+            const history = loadSessions().filter((r) => r.id !== report.record.id);
+            assessRun(report.record, history)
+              .then((ai) => {
+                // ignore a late answer if the player already started another run
+                if (useAstro.getState().report?.record.id === report.record.id) {
+                  useAstro.getState().setAi(ai, 'ready');
+                }
+              })
+              .catch(() => {
+                if (useAstro.getState().report?.record.id === report.record.id) {
+                  useAstro.getState().setAi(null, 'offline');
+                }
+              });
           } catch {
             useAstro.getState().pushBanner('Could not save this session', 'warn', 3000);
           }

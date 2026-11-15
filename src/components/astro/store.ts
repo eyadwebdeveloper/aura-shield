@@ -7,6 +7,7 @@
 import { create } from 'zustand';
 import type { CrewStreak, RunReport, RouteChoice } from './assessment';
 import { loadStreak } from './assessment';
+import type { AiAssessment, AiStatus } from './ai';
 
 export type Phase = 'intro' | 'countdown' | 'running' | 'paused' | 'results';
 
@@ -53,6 +54,8 @@ interface AstroStore {
   muted: boolean;
   showSurgeon: boolean; // clinical view toggle on the results card
   report: RunReport | null;
+  ai: AiAssessment | null; // result of the backend game-session AI
+  aiStatus: AiStatus;
   streak: CrewStreak;
   lastScore: number;
   runsToday: number;
@@ -69,6 +72,7 @@ interface AstroStore {
   toggleMute: () => void;
   setShowSurgeon: (v: boolean) => void;
   setReport: (r: RunReport | null) => void;
+  setAi: (ai: AiAssessment | null, status: AiStatus) => void;
   bumpRunsToday: () => void;
   resetForRun: () => void;
 }
@@ -78,7 +82,7 @@ const initialHud: HudState = {
   energy: 100,
   combo: 0,
   mult: 1,
-  timeLeft: 120,
+  timeLeft: 40,
   speed: 0,
   distance: 0,
   inverted: false,
@@ -97,6 +101,8 @@ export const useAstro = create<AstroStore>((set) => ({
   muted: false,
   showSurgeon: false,
   report: null,
+  ai: null,
+  aiStatus: 'idle',
   streak: { count: 0, lastDayKey: '', personalBest: 0 },
   lastScore: 0,
   runsToday: 0,
@@ -123,6 +129,7 @@ export const useAstro = create<AstroStore>((set) => ({
       lastScore: r ? r.log.score : s.lastScore,
       showSurgeon: false,
     })),
+  setAi: (ai, status) => set({ ai, aiStatus: status }),
   bumpRunsToday: () => set((s) => ({ runsToday: s.runsToday + 1 })),
   resetForRun: () =>
     set({
@@ -131,6 +138,8 @@ export const useAstro = create<AstroStore>((set) => ({
       radar: null,
       forkOpen: false,
       report: null,
+      ai: null,
+      aiStatus: 'idle',
       showSurgeon: false,
     }),
 }));

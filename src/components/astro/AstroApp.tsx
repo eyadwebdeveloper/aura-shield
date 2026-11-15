@@ -34,9 +34,9 @@ export default function AstroApp({ onOpenAtlas }: { onOpenAtlas: () => void }) {
             <Gamepad2 size={15} className="text-amber-300" />
           </div>
           <div className="leading-none">
-            <div className="text-[15px] font-bold tracking-[0.18em] text-zinc-50">ASTRO-SHIELD</div>
-            <div className="mt-1 hidden text-[9.5px] uppercase tracking-[0.22em] text-zinc-500 sm:block">
-              Daily 2-Minute Crew Challenge
+            <div className="font-display text-[16px] font-bold tracking-[0.22em] text-zinc-50">ASTRO-SHIELD</div>
+            <div className="mt-1 hidden font-display text-[9.5px] uppercase tracking-[0.24em] text-zinc-500 sm:block">
+              40-Second Crew Challenge
             </div>
           </div>
         </div>

@@ -91,7 +91,7 @@ export function SystemsPanel({ onDone }: { onDone?: () => void }) {
       </div>
       <Separator className="bg-white/5" />
       <ScrollArea className="min-h-0 flex-1">
-        <div className="px-2 py-2">
+        <div className="px-2 py-2" style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
           {rows.length === 0 && (
             <p className="px-3 py-6 text-xs text-zinc-500">Loading systems…</p>
           )}
